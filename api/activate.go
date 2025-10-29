@@ -80,7 +80,7 @@ CREATE TABLE IF NOT EXISTS activations (
     id BIGSERIAL PRIMARY KEY,
     brand TEXT NOT NULL,
     model TEXT NOT NULL,
-    serial_number TEXT NOT NULL UNIQUE,
+    serial_number TEXT NOT NULL,
     device_id TEXT NOT NULL,
     activated_at TIMESTAMPTZ NOT NULL,
     active_minutes INTEGER NOT NULL CHECK (active_minutes >= 0),
@@ -100,6 +100,24 @@ DROP TRIGGER IF EXISTS activations_set_updated_at ON activations;
 CREATE TRIGGER activations_set_updated_at
 BEFORE UPDATE ON activations
 FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- Ensure we do not have a unique constraint only on serial_number
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1
+    FROM   pg_constraint c
+    JOIN   pg_class t ON t.oid = c.conrelid
+    WHERE  t.relname = 'activations'
+    AND    c.conname = 'activations_serial_number_key'
+  ) THEN
+    ALTER TABLE activations DROP CONSTRAINT activations_serial_number_key;
+  END IF;
+END$$;
+
+-- Enforce uniqueness on (serial_number, device_id)
+CREATE UNIQUE INDEX IF NOT EXISTS activations_serial_device_uidx
+ON activations (serial_number, device_id);
 `
 	_, err := conn.ExecContext(ctx, ddl)
 	return err
@@ -236,7 +254,7 @@ func upsertActivation(ctx context.Context, conn *sql.DB, a activateRequest) erro
 INSERT INTO activations (
   brand, model, serial_number, device_id, activated_at, active_minutes
 ) VALUES ($1, $2, $3, $4, $5, $6)
-ON CONFLICT (serial_number) DO UPDATE SET
+ON CONFLICT (serial_number, device_id) DO UPDATE SET
   brand = EXCLUDED.brand,
   model = EXCLUDED.model,
   device_id = EXCLUDED.device_id,
@@ -260,9 +278,9 @@ func upsertActivationSupabase(ctx context.Context, supabaseURL, serviceRoleKey s
 	if strings.TrimSpace(supabaseURL) == "" || strings.TrimSpace(serviceRoleKey) == "" {
 		return errors.New("supabase not configured")
 	}
-	// PostgREST upsert with on_conflict on serial_number
-	// Endpoint: {SUPABASE_URL}/rest/v1/activations?on_conflict=serial_number
-	endpoint := strings.TrimRight(supabaseURL, "/") + "/rest/v1/activations?on_conflict=serial_number"
+	// PostgREST upsert with on_conflict on (serial_number, device_id)
+	// Endpoint: {SUPABASE_URL}/rest/v1/activations?on_conflict=serial_number,device_id
+	endpoint := strings.TrimRight(supabaseURL, "/") + "/rest/v1/activations?on_conflict=serial_number,device_id"
 
 	payload := map[string]any{
 		"brand":          a.Brand,
