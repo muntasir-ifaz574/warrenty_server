@@ -183,11 +183,19 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 	persisted := false
 	if db != nil && dbInitError == nil {
 		if err := upsertActivation(ctx, db, req); err != nil {
-			// Do not expose internals; return 500
 			http.Error(w, "failed to store activation", http.StatusInternalServerError)
 			return
 		}
 		persisted = true
+	} else {
+		// Try Supabase REST fallback if DATABASE_URL is not configured
+		if sbURL := strings.TrimSpace(os.Getenv("SUPABASE_URL")); sbURL != "" {
+			if err := upsertActivationSupabase(ctx, sbURL, os.Getenv("SUPABASE_SERVICE_ROLE_KEY"), req); err != nil {
+				http.Error(w, "failed to store activation", http.StatusInternalServerError)
+				return
+			}
+			persisted = true
+		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -196,7 +204,7 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 	if persisted {
 		resp.Message = "activation stored"
 	} else {
-		resp.Message = "accepted without persistence (DATABASE_URL not set)"
+		resp.Message = "accepted without persistence (no DATABASE_URL or Supabase configured)"
 	}
 	_ = json.NewEncoder(w).Encode(resp)
 }
@@ -246,4 +254,43 @@ ON CONFLICT (serial_number) DO UPDATE SET
 		a.ActiveMinutes,
 	)
 	return err
+}
+
+func upsertActivationSupabase(ctx context.Context, supabaseURL, serviceRoleKey string, a activateRequest) error {
+	if strings.TrimSpace(supabaseURL) == "" || strings.TrimSpace(serviceRoleKey) == "" {
+		return errors.New("supabase not configured")
+	}
+	// PostgREST upsert with on_conflict on serial_number
+	// Endpoint: {SUPABASE_URL}/rest/v1/activations?on_conflict=serial_number
+	endpoint := strings.TrimRight(supabaseURL, "/") + "/rest/v1/activations?on_conflict=serial_number"
+
+	payload := map[string]any{
+		"brand":          a.Brand,
+		"model":          a.Model,
+		"serial_number":  a.SerialNumber,
+		"device_id":      a.DeviceID,
+		"activated_at":   a.ActivatedAt.UTC().Format(time.RFC3339),
+		"active_minutes": a.ActiveMinutes,
+	}
+	body, _ := json.Marshal(payload)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(string(body)))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("apikey", serviceRoleKey)
+	req.Header.Set("Authorization", "Bearer "+serviceRoleKey)
+	// Upsert behavior
+	req.Header.Set("Prefer", "resolution=merge-duplicates")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("supabase insert failed: %s", resp.Status)
+	}
+	return nil
 }
