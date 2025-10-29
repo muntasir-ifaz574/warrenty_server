@@ -101,19 +101,27 @@ CREATE TRIGGER activations_set_updated_at
 BEFORE UPDATE ON activations
 FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 
--- Ensure we do not have a unique constraint only on serial_number
-DO $$
-BEGIN
-  IF EXISTS (
-    SELECT 1
-    FROM   pg_constraint c
-    JOIN   pg_class t ON t.oid = c.conrelid
-    WHERE  t.relname = 'activations'
-    AND    c.conname = 'activations_serial_number_key'
-  ) THEN
-    ALTER TABLE activations DROP CONSTRAINT activations_serial_number_key;
-  END IF;
-END$$;
+	-- Drop any existing unique constraint that applies only to (serial_number), regardless of its name
+	DO $$
+	DECLARE
+	  cons RECORD;
+	BEGIN
+	  FOR cons IN (
+	    SELECT c.conname
+	    FROM pg_constraint c
+	    JOIN pg_class t ON t.oid = c.conrelid
+	    JOIN pg_namespace ns ON ns.oid = t.relnamespace
+	    WHERE t.relname = 'activations'
+	      AND c.contype = 'u'
+	      AND (
+	        SELECT array_agg(att.attname ORDER BY att.attnum)
+	        FROM unnest(c.conkey) WITH ORDINALITY AS cols(attnum, ord)
+	        JOIN pg_attribute att ON att.attrelid = t.oid AND att.attnum = cols.attnum
+	      ) = ARRAY['serial_number']
+	  ) LOOP
+	    EXECUTE format('ALTER TABLE activations DROP CONSTRAINT %I', cons.conname);
+	  END LOOP;
+	END$$;
 
 -- Enforce uniqueness on (serial_number, device_id)
 CREATE UNIQUE INDEX IF NOT EXISTS activations_serial_device_uidx
