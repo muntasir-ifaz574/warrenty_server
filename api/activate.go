@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -122,11 +123,52 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req activateRequest
-	dec := json.NewDecoder(r.Body)
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&req); err != nil {
-		http.Error(w, "invalid JSON body", http.StatusBadRequest)
-		return
+	ct := r.Header.Get("Content-Type")
+	if strings.Contains(ct, "multipart/form-data") || strings.Contains(ct, "application/x-www-form-urlencoded") {
+		// Accept form-data and x-www-form-urlencoded
+		// Limit to 1MB form memory; no files expected
+		if strings.Contains(ct, "multipart/form-data") {
+			if err := r.ParseMultipartForm(1 << 20); err != nil {
+				http.Error(w, "invalid multipart form", http.StatusBadRequest)
+				return
+			}
+		} else {
+			if err := r.ParseForm(); err != nil {
+				http.Error(w, "invalid form body", http.StatusBadRequest)
+				return
+			}
+		}
+		req.Brand = strings.TrimSpace(r.FormValue("brand"))
+		req.Model = strings.TrimSpace(r.FormValue("model"))
+		req.SerialNumber = strings.TrimSpace(r.FormValue("serialNumber"))
+		req.DeviceID = strings.TrimSpace(r.FormValue("deviceId"))
+		// Parse activatedAt as RFC3339
+		activatedAtStr := strings.TrimSpace(r.FormValue("activatedAt"))
+		if activatedAtStr != "" {
+			t, err := time.Parse(time.RFC3339, activatedAtStr)
+			if err != nil {
+				http.Error(w, "activatedAt must be RFC3339 (e.g., 2025-10-29T12:34:56Z)", http.StatusBadRequest)
+				return
+			}
+			req.ActivatedAt = t
+		}
+		// Parse activeMinutes
+		if am := strings.TrimSpace(r.FormValue("activeMinutes")); am != "" {
+			v, err := strconv.Atoi(am)
+			if err != nil {
+				http.Error(w, "activeMinutes must be an integer", http.StatusBadRequest)
+				return
+			}
+			req.ActiveMinutes = v
+		}
+	} else {
+		// Default to JSON
+		dec := json.NewDecoder(r.Body)
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&req); err != nil {
+			http.Error(w, "invalid JSON body", http.StatusBadRequest)
+			return
+		}
 	}
 
 	if err := validate(req); err != nil {
