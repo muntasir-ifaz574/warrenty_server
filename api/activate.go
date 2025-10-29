@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -288,9 +289,9 @@ func upsertActivationSupabase(ctx context.Context, supabaseURL, serviceRoleKey s
 	if strings.TrimSpace(supabaseURL) == "" || strings.TrimSpace(serviceRoleKey) == "" {
 		return errors.New("supabase not configured")
 	}
-	// PostgREST upsert with on_conflict on (serial_number, device_id)
-	// Endpoint: {SUPABASE_URL}/rest/v1/activations?on_conflict=serial_number,device_id
-	endpoint := strings.TrimRight(supabaseURL, "/") + "/rest/v1/activations?on_conflict=serial_number,device_id"
+	// Prefer upsert via on_conflict, then gracefully fall back to manual GET+PATCH/POST
+	base := strings.TrimRight(supabaseURL, "/") + "/rest/v1/activations"
+	endpoint := base + "?on_conflict=serial_number,device_id"
 
 	payload := map[string]any{
 		"brand":          a.Brand,
@@ -309,7 +310,6 @@ func upsertActivationSupabase(ctx context.Context, supabaseURL, serviceRoleKey s
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("apikey", serviceRoleKey)
 	req.Header.Set("Authorization", "Bearer "+serviceRoleKey)
-	// Upsert behavior
 	req.Header.Set("Prefer", "resolution=merge-duplicates")
 
 	resp, err := http.DefaultClient.Do(req)
@@ -317,10 +317,115 @@ func upsertActivationSupabase(ctx context.Context, supabaseURL, serviceRoleKey s
 		return err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode >= 300 {
-		// include response body for diagnostics
-		b, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("supabase insert failed: %s: %s", resp.Status, strings.TrimSpace(string(b)))
+	if resp.StatusCode < 300 {
+		return nil
 	}
-	return nil
+
+	// include response body for diagnostics
+	b, _ := io.ReadAll(resp.Body)
+	errText := strings.TrimSpace(string(b))
+
+	// If missing unique or ON CONFLICT unsupported, manual upsert
+	if strings.Contains(strings.ToLower(errText), "no unique") || strings.Contains(strings.ToLower(errText), "on conflict") {
+		serialEsc := url.QueryEscape(a.SerialNumber)
+		deviceEsc := url.QueryEscape(a.DeviceID)
+		rowFilter := "?serial_number=eq." + serialEsc + "&device_id=eq." + deviceEsc
+
+		// Check existence
+		getURL := base + rowFilter + "&select=id&limit=1"
+		greq, gerr := http.NewRequestWithContext(ctx, http.MethodGet, getURL, nil)
+		if gerr != nil {
+			return gerr
+		}
+		greq.Header.Set("apikey", serviceRoleKey)
+		greq.Header.Set("Authorization", "Bearer "+serviceRoleKey)
+		gresp, gerr := http.DefaultClient.Do(greq)
+		if gerr != nil {
+			return gerr
+		}
+		defer gresp.Body.Close()
+		gb, _ := io.ReadAll(gresp.Body)
+		if gresp.StatusCode >= 300 {
+			return fmt.Errorf("supabase select failed: %s: %s", gresp.Status, strings.TrimSpace(string(gb)))
+		}
+
+		if len(strings.TrimSpace(string(gb))) > 2 { // existing row
+			updURL := base + rowFilter
+			updBody, _ := json.Marshal(map[string]any{
+				"brand":          a.Brand,
+				"model":          a.Model,
+				"activated_at":   a.ActivatedAt.UTC().Format(time.RFC3339),
+				"active_minutes": a.ActiveMinutes,
+			})
+			preq, perr := http.NewRequestWithContext(ctx, http.MethodPatch, updURL, bytes.NewReader(updBody))
+			if perr != nil {
+				return perr
+			}
+			preq.Header.Set("Content-Type", "application/json")
+			preq.Header.Set("apikey", serviceRoleKey)
+			preq.Header.Set("Authorization", "Bearer "+serviceRoleKey)
+			preq.Header.Set("Prefer", "return=minimal")
+			presp, perr := http.DefaultClient.Do(preq)
+			if perr != nil {
+				return perr
+			}
+			defer presp.Body.Close()
+			if presp.StatusCode >= 300 {
+				pb, _ := io.ReadAll(presp.Body)
+				return fmt.Errorf("supabase update failed: %s: %s", presp.Status, strings.TrimSpace(string(pb)))
+			}
+			return nil
+		}
+
+		// Insert new row without on_conflict
+		ireq, ierr := http.NewRequestWithContext(ctx, http.MethodPost, base, bytes.NewReader(body))
+		if ierr != nil {
+			return ierr
+		}
+		ireq.Header.Set("Content-Type", "application/json")
+		ireq.Header.Set("apikey", serviceRoleKey)
+		ireq.Header.Set("Authorization", "Bearer "+serviceRoleKey)
+		ireq.Header.Set("Prefer", "return=minimal")
+		irsp, ierr := http.DefaultClient.Do(ireq)
+		if ierr != nil {
+			return ierr
+		}
+		defer irsp.Body.Close()
+		if irsp.StatusCode == http.StatusConflict {
+			// Race: update instead
+			updURL := base + rowFilter
+			updBody, _ := json.Marshal(map[string]any{
+				"brand":          a.Brand,
+				"model":          a.Model,
+				"activated_at":   a.ActivatedAt.UTC().Format(time.RFC3339),
+				"active_minutes": a.ActiveMinutes,
+			})
+			preq, perr := http.NewRequestWithContext(ctx, http.MethodPatch, updURL, bytes.NewReader(updBody))
+			if perr != nil {
+				return perr
+			}
+			preq.Header.Set("Content-Type", "application/json")
+			preq.Header.Set("apikey", serviceRoleKey)
+			preq.Header.Set("Authorization", "Bearer "+serviceRoleKey)
+			preq.Header.Set("Prefer", "return=minimal")
+			presp, perr := http.DefaultClient.Do(preq)
+			if perr != nil {
+				return perr
+			}
+			defer presp.Body.Close()
+			if presp.StatusCode >= 300 {
+				pb, _ := io.ReadAll(presp.Body)
+				return fmt.Errorf("supabase update after conflict failed: %s: %s", presp.Status, strings.TrimSpace(string(pb)))
+			}
+			return nil
+		}
+		if irsp.StatusCode >= 300 {
+			ib, _ := io.ReadAll(irsp.Body)
+			return fmt.Errorf("supabase insert (no on_conflict) failed: %s: %s", irsp.Status, strings.TrimSpace(string(ib)))
+		}
+		return nil
+	}
+
+	// Other errors
+	return fmt.Errorf("supabase insert failed: %s: %s", resp.Status, errText)
 }
