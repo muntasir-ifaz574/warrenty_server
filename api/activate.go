@@ -1,11 +1,13 @@
 package handler
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"strconv"
@@ -209,7 +211,7 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 	persisted := false
 	if db != nil && dbInitError == nil {
 		if err := upsertActivation(ctx, db, req); err != nil {
-			http.Error(w, "failed to store activation", http.StatusInternalServerError)
+			http.Error(w, "failed to store activation: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
 		persisted = true
@@ -217,7 +219,7 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 		// Try Supabase REST fallback if DATABASE_URL is not configured
 		if sbURL := strings.TrimSpace(os.Getenv("SUPABASE_URL")); sbURL != "" {
 			if err := upsertActivationSupabase(ctx, sbURL, os.Getenv("SUPABASE_SERVICE_ROLE_KEY"), req); err != nil {
-				http.Error(w, "failed to store activation", http.StatusInternalServerError)
+				http.Error(w, "failed to store activation: "+err.Error(), http.StatusInternalServerError)
 				return
 			}
 			persisted = true
@@ -300,7 +302,7 @@ func upsertActivationSupabase(ctx context.Context, supabaseURL, serviceRoleKey s
 	}
 	body, _ := json.Marshal(payload)
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(string(body)))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
@@ -316,7 +318,9 @@ func upsertActivationSupabase(ctx context.Context, supabaseURL, serviceRoleKey s
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
-		return fmt.Errorf("supabase insert failed: %s", resp.Status)
+		// include response body for diagnostics
+		b, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("supabase insert failed: %s: %s", resp.Status, strings.TrimSpace(string(b)))
 	}
 	return nil
 }
